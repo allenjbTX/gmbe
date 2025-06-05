@@ -127,9 +127,14 @@ def find_union_atoms(frag_atoms_list):
 
 def add_caps(atom_list, all_atoms):
     """
-    Cap severed bonds by placing H at (R1+RH) along vector from atom toward severed neighbor.
+    Cap severed bonds by placing H at covalent bond distance along vector from atom toward severed neighbor.
     Returns list of (elem, x, y, z) including original atoms + caps.
     """
+    # Covalent radii in Å for typical elements
+    # https://en.wikipedia.org/wiki/Covalent_radius
+    covalent_radii = {
+        'H': 0.31, 'C': 0.73, 'N': 0.71, 'O': 0.66
+    }
     inter_serials = {atom.get_serial_number() for atom in atom_list}
     capped = []
     # Build set of heavy atoms for detecting severed bonds
@@ -140,17 +145,18 @@ def add_caps(atom_list, all_atoms):
         capped.append((elem, coord[0], coord[1], coord[2]))
         if elem == 'H':
             continue
+        R_parent = covalent_radii.get(elem, 0.75)
+        R_H = covalent_radii['H']
+        bond_length = R_parent + R_H  # approximate covalent X-H bond
         for neigh in heavy_all:
             if neigh.get_serial_number() in inter_serials:
                 continue
             dist = np.linalg.norm(atom.get_coord() - neigh.get_coord())
             if dist < 1.8:
-                R1 = vdw_radius(atom.element)
-                RH = vdw_radius('H')
                 r1 = atom.get_coord()
                 r2 = neigh.get_coord()
                 direction = (r2 - r1) / np.linalg.norm(r2 - r1)
-                r_cap = r1 + direction * (R1 + RH)
+                r_cap = r1 + direction * bond_length
                 capped.append(('H', r_cap[0], r_cap[1], r_cap[2]))
     return capped
 
