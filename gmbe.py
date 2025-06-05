@@ -7,36 +7,26 @@ using ORCA for electronic structure calculations and the Liu & Herbert
 This script:
  1. Reads an input PDB of a protein.
  2. Fragments the protein into residue-based groups (P1 or P2 splitting).
- 3. Generates all k-fold intersections of fragment groups up to order N.
- 4. For each intersection (i.e., each "term" in the GMBE), builds a capped geometry,
+ 3. Uses unions of these base fragments to build the GMBE up to order N.
+ 4. For each non-empty union (combo of base fragments), builds a capped geometry,
     writes an ORCA input file, runs ORCA, and parses the single-point energy.
- 5. Accumulates the GMBE energy using inclusion-exclusion coefficients:
-       E_GMBE = sum_{k=1..N} [ (-1)^(k+1) * sum_{all intersections of size k} E(intersection) ]
+ 5. Computes the many-body corrections θ(I) via:
+       θ(I) = E_union(I) - sum_{J ⊂ I, J ≠ I} θ(J)
+    and sums θ(I) over all |I| ≤ N to get E_GMBE.
 
 Charges:
  - Base fragment (whole residue, or P2-main) uses the standard residue net charge:
-     ASP, GLU: -1; LYS, ARG: +1; HIS: +0 (unless protonation variant).
- - For P2 partition, side-chain fragments are assigned zero charge (backbone/main carries full). 
- - Intersection charges = sum of base fragment charges in the combination.
+     ASP, GLU: -1; LYS, ARG: +1; HIS: 0.
+ - For P2 partition, side-chain fragments are assigned zero charge.
+ - Union-charge = sum of base fragment charges in the combination.
 
 Usage:
-    python3 gmbe.py --pdb protein.pdb --partition P1 --order 3 \
-          --method MP2 --basis def2-SVP --orca-path /path/to/orca \
+    python3 gmbe.py --pdb protein.pdb --partition P1 --order 2 \
+          --method GFN2-xTB --basis xtb --orca-path /path/to/orca \
           --workdir gmbe_out
-
-Example:
-    python3 gmbe.py \
-      --pdb myprotein.pdb \
-      --partition P2 \
-      --order 2 \
-      --method GFN2-xTB \
-      --basis xtb \
-      --orca-path /usr/local/orca/orca \
-      --workdir run_gmbe
 
 """
 import os
-import sys
 import argparse
 import itertools
 import subprocess
@@ -51,13 +41,13 @@ RESIDUE_CHARGES = {
     'LYS': +1,
     'ARG': +1,
     'HIS': 0,
-    # assume HIS neutral by default; adjust if HIP present
+    # assume HIS neutral by default
 }
 
 # ------------------------- Utility Functions -------------------------
 
 def vdw_radius(element):
-    """Return van der Waals radius (Å) for common elements."""
+    """Return approximate van der Waals radius (Å) for common elements."""
     radii = {
         'H': 1.20, 'C': 1.70, 'N': 1.55, 'O': 1.52, 'S': 1.80,
         'P': 1.80, 'F': 1.47, 'Cl': 1.75, 'Br': 1.85, 'I': 1.98
@@ -68,11 +58,9 @@ def vdw_radius(element):
 def define_residue_groups(structure, partition='P1'):
     """
     Define base fragment groups per Liu & Herbert (2016):
-      - P1: one group per residue, cutting C(=O)-Cα.
+      - P1: one group per residue.
       - P2: if residue has >15 heavy atoms, split into main-chain and side-chain.
-    Also assign each base fragment an integer net charge based on residue name.
-
-    Returns: dict { group_id: {'atoms': [Atom,...], 'charge': int} }.
+    Also assign net charge to each base fragment.
     """
     groups = {}
     idx = 0
@@ -85,12 +73,10 @@ def define_residue_groups(structure, partition='P1'):
                 z_res = RESIDUE_CHARGES.get(resname, 0)
                 heavy_atoms = [atom for atom in residue if atom.element != 'H']
                 if partition == 'P2' and len(heavy_atoms) > 15:
-                    # split into backbone (N, CA, C, O, CB) and sidechain
                     backbone_names = set(['N', 'CA', 'C', 'O', 'CB'])
                     backbone_atoms = [a for a in heavy_atoms if a.get_name() in backbone_names]
                     sidechain_atoms = [a for a in heavy_atoms if a.get_name() not in backbone_names]
                     main_id = f"res{idx:04d}_main"
-                    # assign full residue charge to main; side gets 0
                     groups[main_id] = {'atoms': backbone_atoms, 'charge': z_res}
                     idx += 1
                     side_id = f"res{idx:04d}_side"
@@ -98,32 +84,27 @@ def define_residue_groups(structure, partition='P1'):
                     idx += 1
                 else:
                     gid = f"res{idx:04d}"
-                    # whole residue carries z_res
                     groups[gid] = {'atoms': heavy_atoms, 'charge': z_res}
                     idx += 1
     return groups
 
 
-def find_intersection_atoms(frag_atoms_list):
+def find_union_atoms(frag_atoms_list):
     """
-    Given a list of fragment atom-lists (each is a list of Atom objects),
-    return the list of atoms present in all fragments (intersection by serial number).
+    Return the union of atom lists from frag_atoms_list (no duplicates).
     """
-    # Convert each fragment's atoms to dict {serial: Atom}
-    sets = [ {atom.get_serial_number(): atom for atom in frag} for frag in frag_atoms_list ]
-    # Compute common serial numbers
-    common_serials = set(sets[0].keys())
-    for s in sets[1:]:
-        common_serials &= set(s.keys())
-    # Return the Atom objects corresponding to common_serials (from first dict)
-    return [sets[0][ser] for ser in sorted(common_serials)]
+    union_dict = {}
+    for frag in frag_atoms_list:
+        for atom in frag:
+            serial = atom.get_serial_number()
+            if serial not in union_dict:
+                union_dict[serial] = atom
+    return list(union_dict.values())
 
 
 def add_caps(atom_list, all_atoms):
     """
-    Given a list of Atom objects (the intersection), identify severed bonds to atoms
-    not in the list and cap each severed bond by placing a hydrogen.
-    Returns: list of (element, x, y, z) including original atoms + caps.
+    Cap severed bonds by placing H at (R1+RH) along vector from neighbor to atom.
     """
     inter_serials = {atom.get_serial_number() for atom in atom_list}
     capped = []
@@ -135,13 +116,11 @@ def add_caps(atom_list, all_atoms):
         for neigh in all_nonH:
             if neigh.get_serial_number() in inter_serials:
                 continue
-            dist = np.linalg.norm(atom.get_coord() - neigh.get_coord())
+            dist = np.linalg.norm(coord - neigh.get_coord())
             if dist < 1.8:
-                # severed bond → place H cap
                 R1 = vdw_radius(atom.element)
-                R2 = vdw_radius(neigh.element)
                 RH = vdw_radius('H')
-                r1 = atom.get_coord()
+                r1 = coord
                 r2 = neigh.get_coord()
                 direction = (r1 - r2) / np.linalg.norm(r1 - r2)
                 r_cap = r1 + direction * (R1 + RH)
@@ -152,23 +131,23 @@ def add_caps(atom_list, all_atoms):
 def write_xyz(atom_coords, filename):
     """Write list of (elem, x, y, z) to an XYZ file."""
     with open(filename, 'w') as f:
-        f.write(f"{len(atom_coords)}")
-        f.write(f"{filename}")
+        f.write(f"{len(atom_coords)}\n")
+        f.write(f"{filename}\n")
         for elem, x, y, z in atom_coords:
-            f.write(f"{elem} {x:.6f} {y:.6f} {z:.6f}")
+            f.write(f"{elem} {x:.6f} {y:.6f} {z:.6f}\n")
 
 
 def generate_orca_input(workdir, frag_id, atom_coords, method, basis, charge, mult, embedding_charges=None):
     """
-    Create ORCA input file for a given fragment or intersection.
+    Create ORCA input file for fragment.
     """
     filename = f"{frag_id}.inp"
     filepath = workdir / filename
     with open(filepath, 'w') as f:
         if basis:
-            f.write(f"! {method} {basis} TightSCF\n")
+            f.write(f"! {method} {basis} TightSCF NoRI\n")
         else:
-            f.write(f"! {method} TightSCF\n")
+            f.write(f"! {method} TightSCF NoRI\n")
         f.write("%pal nprocs 1 end\n")
         if embedding_charges:
             f.write("%pointcharges\n")
@@ -183,14 +162,10 @@ def generate_orca_input(workdir, frag_id, atom_coords, method, basis, charge, mu
 
 
 def run_orca(orcapath, input_file):
-    """Run ORCA point calculation; return output filename."""
-    # ensure absolute paths so cwd changes don't break file locations
-    input_path = os.path.abspath(input_file)
-    output_file = input_path.replace('.inp', '.out')
-    # make sure the output directory exists
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    """Run ORCA; return output filename."""
+    output_file = input_file.replace('.inp', '.out')
     with open(output_file, 'w') as out:
-        subprocess.run([orcapath, input_path], stdout=out, stderr=subprocess.STDOUT)
+        subprocess.run([orcapath, input_file], stdout=out, stderr=subprocess.STDOUT)
     return output_file
 
 
@@ -210,64 +185,59 @@ def main():
         description='GMBE to arbitrary order for proteins with ORCA')
     parser.add_argument('--pdb', required=True, help='Protein PDB file')
     parser.add_argument('--partition', choices=['P1', 'P2'], default='P1', help='Partition scheme')
-    parser.add_argument('--order', type=int, required=True, help='Max GMBE order (1 = monomer, 2 = pairs, etc)')
+    parser.add_argument('--order', type=int, required=True, help='Max GMBE order (<= number of fragments)')
     parser.add_argument('--method', required=True, help='QM method for ORCA (e.g., MP2, B3LYP)')
-    parser.add_argument('--basis', required=False, help='Basis set for ORCA (e.g., def2-SVP, cc-pVDZ)')
-    parser.add_argument('--mult', type=int, default=1, help='Multiplicity for each fragment (default: 1)')
+    parser.add_argument('--basis', required=False, help='Basis set or semiempirical (e.g., xtb)')
+    parser.add_argument('--mult', type=int, default=1, help='Multiplicity for each fragment')
     parser.add_argument('--orca-path', default='orca', help='Path to ORCA executable')
-    parser.add_argument('--workdir', default='gmbe', help='Working directory')
+    parser.add_argument('--workdir', default='gmbe_order', help='Working directory')
     args = parser.parse_args()
 
-    # Create workdir and copy PDB
+    # Prepare working directory
     wd = Path(args.workdir)
     wd.mkdir(parents=True, exist_ok=True)
     pdb_target = wd / 'protein.pdb'
     from shutil import copyfile
     copyfile(args.pdb, pdb_target)
 
-    # Parse structure once
+    # Parse structure
     parser_pdb = PDBParser(QUIET=True)
     structure = parser_pdb.get_structure('protein', str(pdb_target))
     all_atoms = [atom for atom in structure.get_atoms() if atom.element != 'H']
 
-    # 1) Fragment via P1/P2, with charges
+    # Fragment base groups
     base_groups = define_residue_groups(structure, partition=args.partition)
     frag_ids = sorted(base_groups.keys())
-    num_frags = len(frag_ids)
-    print(f"Defined {num_frags} base fragments (order-1 terms). Charges assigned per residue.")
+    print(f"Defined {len(frag_ids)} base fragments. Charges assigned per residue.")
 
-    # 2) For k = 1..order, generate all combinations
-    energies = {}  # map frozenset of frag_ids -> energy
-    charges_map = {}
+    E_union = {}  # raw union energy for each subset
+    theta = {}    # many-body correction for each subset
     total_gmbe = 0.0
+
+    # Check order
+    max_order = len(frag_ids)
+    if args.order > max_order:
+        print(f"Warning: order {args.order} > number of fragments ({max_order}); truncating to {max_order}.")
+        args.order = max_order
+
     for k in range(1, args.order + 1):
-        coeff = (-1)**(k+1)
-        print(f"Generating all {k}-fragment intersections (coeff = {coeff})...")
+        print(f"Computing all {k}-fold unions...")
+        # Compute E_union for each subset of size k
         for combo in itertools.combinations(frag_ids, k):
             combo_key = frozenset(combo)
-            # Determine intersection of atoms
-            frag_atoms_list = [base_groups[fid]['atoms'] for fid in combo]
-            # for k ≥ 2 use the union of the k fragments
-            atoms_union = {a.get_serial_number(): a for sub in frag_atoms_list for a in sub}
-            union_atoms = list(atoms_union.values())
+            frag_atoms_list = [base_groups[f]['atoms'] for f in combo]
+            union_atoms = find_union_atoms(frag_atoms_list)
+            if not union_atoms:
+                continue
+            frag_charge = sum(base_groups[f]['charge'] for f in combo)
             capped = add_caps(union_atoms, all_atoms)
-            # Compute net charge for this intersection = sum of base fragment charges
-            frag_charge = sum(base_groups[fid]['charge'] for fid in combo)
-            charges_map[combo_key] = frag_charge
-            # inter_atoms = find_intersection_atoms(frag_atoms_list)
-            # if not inter_atoms:
-            #     continue
-            # Cap the intersection atoms
-            #capped = add_caps(inter_atoms, all_atoms)
-            # Write XYZ (optional)
-            xyz_name = wd / f"inter_{'_'.join(combo)}.xyz"
+            xyz_name = wd / f"union_{'_'.join(combo)}.xyz"
             write_xyz(capped, str(xyz_name))
-            # Create ORCA input with correct charge
-            inp_name = wd / f"inter_{'_'.join(combo)}.inp"
+            inp_name = wd / f"union_{'_'.join(combo)}.inp"
             #os.chdir(wd)
             generate_orca_input(
                 workdir=wd,
-                frag_id=f"inter_{'_'.join(combo)}",
+                frag_id=f"union_{'_'.join(combo)}",
                 atom_coords=capped,
                 method=args.method,
                 basis=args.basis,
@@ -275,30 +245,40 @@ def main():
                 mult=args.mult,
                 embedding_charges=None
             )
-            # Run ORCA
             out_name = run_orca(args.orca_path, str(inp_name))
             e = parse_orca_energy(str(out_name))
-            energies[combo_key] = e
-            total_gmbe += coeff * e
-            print(f"  Combo {combo} (charge={frag_charge}) → E = {e:.6f} Ha → add {coeff*e:.6f}")
-        print(f"Completed order {k} terms.")
+            E_union[combo_key] = e
+            print(f"  E_union({combo}) = {e:.6f} Ha")
 
-    print(f"GMBE({args.order}) total energy = {total_gmbe:.6f} Ha")
+        print(f"Computing θ contributions for order k={k}...")
+        for combo in itertools.combinations(frag_ids, k):
+            combo_key = frozenset(combo)
+            if combo_key not in E_union:
+                continue
+            # Sum all θ(J) for proper subsets J of combo
+            sum_subsets = 0.0
+            for r in range(1, k):
+                for sub in itertools.combinations(combo, r):
+                    sum_subsets += theta[frozenset(sub)]
+            theta_val = E_union[combo_key] - sum_subsets
+            theta[combo_key] = theta_val
+            total_gmbe += theta_val
+            print(f"  θ({combo}) = {theta_val:.6f} Ha; cumulative E_GMBE = {total_gmbe:.6f}")
+        print(f"Completed ΔE for k={k}.\n")
 
-    # Write summary to file
+    print(f"Final GMBE({args.order}) total energy = {total_gmbe:.6f} Ha")
+
     summary = wd / 'gmbe_energy_summary.txt'
     with open(summary, 'w') as f:
-        f.write(f"GMBE up to order {args.order}")
-        f.write("Residue-based charges used. Intersection charge = sum of base charges.")
-        f.write(f"Total GMBE Energy: {total_gmbe:.6f} Ha")
-
-        for combo_key, e in energies.items():
+        f.write(f"GMBE up to order {args.order}\n")
+        f.write("Using θ(I) = E_union(I) - sum_{J subset I} θ(J)\n")
+        f.write(f"Total GMBE Energy: {total_gmbe:.6f} Ha\n\n")
+        for combo_key, th in theta.items():
             k = len(combo_key)
-            coeff = (-1)**(k+1)
-            cq = charges_map[combo_key]
-            f.write(f"Term {sorted(combo_key)} (k={k}, charge={cq}): E = {e:.6f}, coeff = {coeff}, contribution = {coeff*e:.6f}")
-            
+            cq = sum(base_groups[f]['charge'] for f in combo_key)
+            f.write(f"θ({sorted(combo_key)}) (|I|={k}, charge={cq}) = {th:.6f}\n")
     print(f"Summary written to {summary}")
 
 if __name__ == '__main__':
     main()
+
