@@ -55,24 +55,38 @@ def vdw_radius(element):
     return radii.get(element, 1.75)
 
 
+
 def define_residue_groups(structure, partition='P1'):
     """
     Define base fragment groups per Liu & Herbert (2016):
       - P1: one group per residue, including all atoms (heavy + H).
       - P2: if residue has >15 heavy atoms, split into main-chain and side-chain (each including any H bonded).
-    Also assign net charge to each base fragment.
+    Assign net charge to each base fragment, adjusting terminal residues:
+      - For first (N-terminal) residue in each chain: charge += 1
+      - For last (C-terminal) residue in each chain: charge -= 1
 
     Returns: dict { group_id: {'atoms': [Atom,...], 'charge': int} }.
     """
     groups = {}
     idx = 0
+    # Determine terminal residues per chain
     for model in structure:
         for chain in model:
-            for residue in chain:
-                if residue.id[0] != ' ':  # skip hetero/water
-                    continue
+            # Collect only standard residues in order
+            residues = [res for res in chain if res.id[0] == ' ']
+            if not residues:
+                continue
+            first_res = residues[0]
+            last_res = residues[-1]
+            for residue in residues:
                 resname = residue.get_resname()
+                # Base side-chain charge lookup
                 z_res = RESIDUE_CHARGES.get(resname, 0)
+                # Adjust for terminals
+                if residue == first_res:
+                    z_res += 1
+                if residue == last_res:
+                    z_res -= 1
                 all_atoms_res = [atom for atom in residue]  # include H
                 heavy_atoms = [atom for atom in all_atoms_res if atom.element != 'H']
                 if partition == 'P2' and len(heavy_atoms) > 15:
@@ -81,14 +95,11 @@ def define_residue_groups(structure, partition='P1'):
                     side_atoms = []
                     for atom in all_atoms_res:
                         if atom.element == 'H':
-                            parent_name = atom.get_parent().get_resname()
-                            # attach H to heavy atom: include if bonded to a backbone heavy
-                            # approximate by distance to any backbone heavy
                             assigned = False
                             for hb in heavy_atoms:
                                 if hb.get_name() in backbone_names:
                                     dist = np.linalg.norm(atom.get_coord() - hb.get_coord())
-                                    if dist < 1.2:  # H-bond length ~1.0, threshold 1.2
+                                    if dist < 1.2:
                                         main_atoms.append(atom)
                                         assigned = True
                                         break
