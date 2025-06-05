@@ -6,7 +6,7 @@ using ORCA for electronic structure calculations and the Liu & Herbert
 
 This script:
  1. Reads an input PDB of a protein.
- 2. Fragments the protein into residue-based groups (P1 or P2 splitting).
+ 2. Fragments the protein into residue-based groups (P1 or P2 splitting), preserving all atoms including hydrogens.
  3. Uses unions of these base fragments to build the GMBE up to order N.
  4. For each non-empty union (combo of base fragments), builds a capped geometry,
     writes an ORCA input file, runs ORCA, and parses the single-point energy.
@@ -58,9 +58,11 @@ def vdw_radius(element):
 def define_residue_groups(structure, partition='P1'):
     """
     Define base fragment groups per Liu & Herbert (2016):
-      - P1: one group per residue.
-      - P2: if residue has >15 heavy atoms, split into main-chain and side-chain.
+      - P1: one group per residue, including all atoms (heavy + H).
+      - P2: if residue has >15 heavy atoms, split into main-chain and side-chain (each including any H bonded).
     Also assign net charge to each base fragment.
+
+    Returns: dict { group_id: {'atoms': [Atom,...], 'charge': int} }.
     """
     groups = {}
     idx = 0
@@ -71,27 +73,48 @@ def define_residue_groups(structure, partition='P1'):
                     continue
                 resname = residue.get_resname()
                 z_res = RESIDUE_CHARGES.get(resname, 0)
-                heavy_atoms = [atom for atom in residue if atom.element != 'H']
+                all_atoms_res = [atom for atom in residue]  # include H
+                heavy_atoms = [atom for atom in all_atoms_res if atom.element != 'H']
                 if partition == 'P2' and len(heavy_atoms) > 15:
                     backbone_names = set(['N', 'CA', 'C', 'O', 'CB'])
-                    backbone_atoms = [a for a in heavy_atoms if a.get_name() in backbone_names]
-                    sidechain_atoms = [a for a in heavy_atoms if a.get_name() not in backbone_names]
+                    main_atoms = []
+                    side_atoms = []
+                    for atom in all_atoms_res:
+                        if atom.element == 'H':
+                            parent_name = atom.get_parent().get_resname()
+                            # attach H to heavy atom: include if bonded to a backbone heavy
+                            # approximate by distance to any backbone heavy
+                            assigned = False
+                            for hb in heavy_atoms:
+                                if hb.get_name() in backbone_names:
+                                    dist = np.linalg.norm(atom.get_coord() - hb.get_coord())
+                                    if dist < 1.2:  # H-bond length ~1.0, threshold 1.2
+                                        main_atoms.append(atom)
+                                        assigned = True
+                                        break
+                            if not assigned:
+                                side_atoms.append(atom)
+                        else:
+                            if atom.get_name() in backbone_names:
+                                main_atoms.append(atom)
+                            else:
+                                side_atoms.append(atom)
                     main_id = f"res{idx:04d}_main"
-                    groups[main_id] = {'atoms': backbone_atoms, 'charge': z_res}
+                    groups[main_id] = {'atoms': main_atoms, 'charge': z_res}
                     idx += 1
                     side_id = f"res{idx:04d}_side"
-                    groups[side_id] = {'atoms': sidechain_atoms, 'charge': 0}
+                    groups[side_id] = {'atoms': side_atoms, 'charge': 0}
                     idx += 1
                 else:
                     gid = f"res{idx:04d}"
-                    groups[gid] = {'atoms': heavy_atoms, 'charge': z_res}
+                    groups[gid] = {'atoms': all_atoms_res, 'charge': z_res}
                     idx += 1
     return groups
 
 
 def find_union_atoms(frag_atoms_list):
     """
-    Return the union of atom lists from frag_atoms_list (no duplicates).
+    Return the union of atom lists from frag_atoms_list (no duplicates), preserving coordinates.
     """
     union_dict = {}
     for frag in frag_atoms_list:
@@ -104,25 +127,29 @@ def find_union_atoms(frag_atoms_list):
 
 def add_caps(atom_list, all_atoms):
     """
-    Cap severed bonds by placing H at (R1+RH) along vector from neighbor to atom.
+    Cap severed bonds by placing H at (R1+RH) along vector from atom toward severed neighbor.
+    Returns list of (elem, x, y, z) including original atoms + caps.
     """
     inter_serials = {atom.get_serial_number() for atom in atom_list}
     capped = []
-    all_nonH = [atom for atom in all_atoms if atom.element != 'H']
+    # Build set of heavy atoms for detecting severed bonds
+    heavy_all = [atom for atom in all_atoms if atom.element != 'H']
     for atom in atom_list:
         elem = atom.element
         coord = atom.get_coord()
         capped.append((elem, coord[0], coord[1], coord[2]))
-        for neigh in all_nonH:
+        if elem == 'H':
+            continue
+        for neigh in heavy_all:
             if neigh.get_serial_number() in inter_serials:
                 continue
-            dist = np.linalg.norm(coord - neigh.get_coord())
+            dist = np.linalg.norm(atom.get_coord() - neigh.get_coord())
             if dist < 1.8:
                 R1 = vdw_radius(atom.element)
                 RH = vdw_radius('H')
-                r1 = coord
+                r1 = atom.get_coord()
                 r2 = neigh.get_coord()
-                direction = (r1 - r2) / np.linalg.norm(r1 - r2)
+                direction = (r2 - r1) / np.linalg.norm(r2 - r1)
                 r_cap = r1 + direction * (R1 + RH)
                 capped.append(('H', r_cap[0], r_cap[1], r_cap[2]))
     return capped
@@ -185,9 +212,9 @@ def main():
         description='GMBE to arbitrary order for proteins with ORCA')
     parser.add_argument('--pdb', required=True, help='Protein PDB file')
     parser.add_argument('--partition', choices=['P1', 'P2'], default='P1', help='Partition scheme')
-    parser.add_argument('--order', type=int, required=True, help='Max GMBE order (<= number of fragments)')
+    parser.add_argument('--order', type=int, required=True, help='Max GMBE order')
     parser.add_argument('--method', required=True, help='QM method for ORCA (e.g., MP2, B3LYP)')
-    parser.add_argument('--basis', required=False, help='Basis set or semiempirical (e.g., xtb)')
+    parser.add_argument('--basis', required=False, help='Basis set for ORCA (e.g., def2-SVP, cc-pVDZ)')
     parser.add_argument('--mult', type=int, default=1, help='Multiplicity for each fragment')
     parser.add_argument('--orca-path', default='orca', help='Path to ORCA executable')
     parser.add_argument('--workdir', default='gmbe_order', help='Working directory')
@@ -203,7 +230,7 @@ def main():
     # Parse structure
     parser_pdb = PDBParser(QUIET=True)
     structure = parser_pdb.get_structure('protein', str(pdb_target))
-    all_atoms = [atom for atom in structure.get_atoms() if atom.element != 'H']
+    all_atoms = [atom for atom in structure.get_atoms()]
 
     # Fragment base groups
     base_groups = define_residue_groups(structure, partition=args.partition)
@@ -255,7 +282,6 @@ def main():
             combo_key = frozenset(combo)
             if combo_key not in E_union:
                 continue
-            # Sum all θ(J) for proper subsets J of combo
             sum_subsets = 0.0
             for r in range(1, k):
                 for sub in itertools.combinations(combo, r):
@@ -281,4 +307,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
