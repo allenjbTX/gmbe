@@ -193,6 +193,7 @@ def generate_orca_input(workdir, frag_id, atom_coords, method, basis, charge, mu
         else:
             f.write(f"! {method} TightSCF NoRI\n")
         f.write("%pal nprocs 1 end\n")
+        f.write("%scf maxiter 1000 end\n")
         if embedding_charges:
             f.write("%pointcharges\n")
             for (x, y, z), q in embedding_charges.items():
@@ -291,6 +292,8 @@ def main():
             )
             out_name = run_orca(args.orca_path, str(inp_name))
             e = parse_orca_energy(str(out_name))
+            if e is None:
+                raise RuntimeError(f"Failed to parse energy for union {combo}. Check ORCA output {out_name}.")
             E_union[combo_key] = e
             print(f"  E_union({combo}) = {e:.6f} Ha")
 
