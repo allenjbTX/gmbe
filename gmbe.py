@@ -192,6 +192,16 @@ def generate_orca_input(workdir, frag_id, atom_coords, method, basis, charge, mu
             f.write(f"! {method} {basis} TightSCF NoRI\n")
         else:
             f.write(f"! {method} TightSCF NoRI\n")
+        if method.lower() in ['gfn0-xtb', 'xtb0', 'gfn1-xtb', 'xtb1', 'gfn2-xtb', 'xtb2']:
+            f.write("%xtb\n")
+            f.write('   xtbinputstring "--iterations 500"\n')
+            f.write("   DoddCOSMO true\n")
+            f.write("   epsilon 4\n")
+            f.write("end\n") 
+        else:
+            f.write("%cpcm\n")
+            f.write("   epsilon 4\n")
+            f.write("end\n")
         f.write("%pal nprocs 1 end\n")
         f.write("%scf maxiter 1000 end\n")
         if embedding_charges:
